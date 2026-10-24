@@ -1,0 +1,1 @@
+!pip -q install fastopic bertopic sentence-transformers gensim scikit-learn pandas numpy
