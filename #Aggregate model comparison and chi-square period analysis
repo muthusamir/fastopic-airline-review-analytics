@@ -1,0 +1,54 @@
+# Aggregate successful runs: mean and SD over FASTopic seeds; BERTopic has one run per target K.
+ok = comparison[comparison["status"]=="ok"].copy()
+summary = ok.groupby(["model","k"]).agg(
+    n_success=("status","count"),
+    uci_mean=("uci_coherence","mean"), uci_sd=("uci_coherence","std"),
+    npmi_mean=("npmi_coherence","mean"), npmi_sd=("npmi_coherence","std"),
+    diversity_mean=("topic_diversity","mean"), diversity_sd=("topic_diversity","std"),
+    runtime_mean_seconds=("runtime_seconds","mean"), runtime_sd_seconds=("runtime_seconds","std"),
+    outlier_share=("outlier_share","mean")
+).reset_index()
+summary.to_csv(outdir/"table_model_comparison_summary.csv", index=False)
+display(summary)
+
+from scipy.stats import chi2_contingency
+from scipy.stats.contingency import association
+period_map = {}
+for q in df["quarter"]:
+    year, qq = q.split("Q")
+    year, qq = int(year), int(qq)
+    if year < 2020:
+        period_map[q] = "pre-pandemic"
+    elif year < 2022:
+        period_map[q] = "pandemic"
+    else:
+        period_map[q] = "recovery"
+df["period"] = df["quarter"].map(period_map)
+
+chi_results = {}
+for key, labels in assignments.items():
+    labels = np.asarray(labels)
+    if len(labels) != len(df):
+        continue
+    model_name, k, seed = key
+    valid = labels != -1 if model_name == "BERTopic" else np.ones(len(labels), dtype=bool)
+    tmp = pd.DataFrame({"period":df.loc[valid,"period"].values, "topic":labels[valid]})
+    tab = pd.crosstab(tmp["period"], tmp["topic"])
+    if tab.shape[0] < 2 or tab.shape[1] < 2:
+        continue
+    chi2, p, dof, expected = chi2_contingency(tab)
+    n = tab.to_numpy().sum()
+    denom = min(tab.shape[0]-1, tab.shape[1]-1)
+    cramers_v = float(np.sqrt(chi2/(n*denom))) if denom > 0 and n > 0 else np.nan
+    residuals = (tab.to_numpy()-expected)/np.sqrt(expected)
+    chi_results[f"{model_name}_K{k}_seed{seed}"] = {
+        "model":model_name,"k":int(k),"seed":int(seed),"n_included":int(n),
+        "n_outliers_excluded":int((~valid).sum()),"chi_square":float(chi2),"df":int(dof),
+        "p_value":float(p),"cramers_v":cramers_v,
+        "period_topic_counts":{str(i):{str(j):int(tab.loc[i,j]) for j in tab.columns} for i in tab.index},
+        "adjusted_residuals_approx":{str(i):{str(j):float(residuals[ii,jj]) for jj,j in enumerate(tab.columns)}
+                                     for ii,i in enumerate(tab.index)}
+    }
+(outdir/"chi_square.json").write_text(json.dumps(chi_results, indent=2))
+print("Chi-square analyses saved:", len(chi_results))
+print("Output directory:", outdir)
