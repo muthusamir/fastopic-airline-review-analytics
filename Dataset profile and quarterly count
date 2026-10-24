@@ -1,0 +1,59 @@
+from pathlib import Path
+outdir = Path("/content/model_outputs")
+outdir.mkdir(exist_ok=True)
+profile = {
+    "input_file": fname,
+    "input_rows": int(len(df0)),
+    "analysis_rows_after_text_date_filter_and_dedup": int(len(df)),
+    "rows_removed_total": int(len(df0)-len(df)),
+    "date_min": str(df["date_parsed"].min().date()),
+    "date_max": str(df["date_parsed"].max().date()),
+    "quarter_min": str(df["date_parsed"].dt.to_period("Q").min()),
+    "quarter_max": str(df["date_parsed"].dt.to_period("Q").max()),
+    "comment_words_mean": round(float(df["comments"].str.split().str.len().mean()), 2),
+    "comment_words_median": int(df["comments"].str.split().str.len().median()),
+    "comment_words_q1": int(df["comments"].str.split().str.len().quantile(.25)),
+    "comment_words_q3": int(df["comments"].str.split().str.len().quantile(.75)),
+}
+(outdir/"data_profile.json").write_text(json.dumps(profile, indent=2))
+quarter_counts = df.groupby("quarter").size().rename("review_count").reset_index()
+quarter_counts.to_csv(outdir/"table_quarterly_review_counts.csv", index=False)
+display(quarter_counts)
+print(profile)
+#Shared text representation and coherence/diversity functions
+# Use a consistent bigram representation for evaluation.
+# This evaluator is explicit and reproducible; do not mix its values with scores from a different protocol.
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from collections import Counter
+
+def eval_tokens(text):
+    toks = re.findall(r"(?u)\\b[a-zA-Z][a-zA-Z]+\\b", str(text).lower())
+    toks = [t for t in toks if t not in ENGLISH_STOP_WORDS and len(t) >= 3]
+    return [toks[i] + "_" + toks[i+1] for i in range(len(toks)-1)]
+
+tokenized_docs = [eval_tokens(x) for x in docs]
+dictionary = Dictionary(tokenized_docs)
+dictionary.filter_extremes(no_below=2, no_above=0.95)
+texts_for_coherence = [[w for w in row if w in dictionary.token2id] for row in tokenized_docs]
+
+def topic_words_from_terms(term_lists, topn=10):
+    return [list(x[:topn]) for x in term_lists]
+
+def score_topics(topic_terms):
+    topics = [[w for w in t[:10] if w in dictionary.token2id] for t in topic_terms]
+    topics = [t for t in topics if len(t) >= 2]
+    if not topics:
+        return float("nan"), float("nan"), 0.0
+    try:
+        uci = CoherenceModel(topics=topics, texts=texts_for_coherence, dictionary=dictionary,
+                             coherence="c_uci", topn=10, window_size=10).get_coherence()
+    except Exception:
+        uci = float("nan")
+    try:
+        npmi = CoherenceModel(topics=topics, texts=texts_for_coherence, dictionary=dictionary,
+                              coherence="c_npmi", topn=10, window_size=10).get_coherence()
+    except Exception:
+        npmi = float("nan")
+    flat = [w for t in topics for w in t]
+    diversity = len(set(flat))/len(flat) if flat else 0.0
+    return float(uci), float(npmi), float(diversity)
