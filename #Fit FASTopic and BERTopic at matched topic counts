@@ -1,0 +1,141 @@
+# The FASTopic imports/API have changed across releases. This cell checks the installed API.
+from fastopic import FASTopic
+try:
+    from topmost.preprocessing import Preprocessing
+except Exception:
+    try:
+        from fastopic import Preprocessing
+    except Exception as e:
+        raise ImportError("Could not import Preprocessing. Inspect fastopic/topmost documentation for this installed release.") from e
+
+from bertopic import BERTopic
+from sentence_transformers import SentenceTransformer
+from umap import UMAP
+from hdbscan import HDBSCAN
+
+class NgramPreprocessing:
+    def __init__(self, ngram_range=(2,2), vocab_size=5000, stopwords="English"):
+        self.ngram_range = ngram_range
+        self.preprocessing = Preprocessing(vocab_size=vocab_size, stopwords=stopwords)
+        self.vectorizer = CountVectorizer(ngram_range=ngram_range, max_features=vocab_size,
+                                          analyzer=self._custom_analyzer)
+    def _custom_analyzer(self, doc):
+        tokens = CountVectorizer(ngram_range=self.ngram_range).build_analyzer()(doc)
+        return [token.replace(" ", "_") for token in tokens]
+    def preprocess(self, docs, pretrained_WE=False):
+        parsed = self.preprocessing.preprocess(docs, pretrained_WE=pretrained_WE)["train_texts"]
+        bow = self.vectorizer.fit_transform(parsed)
+        return {"train_bow": bow, "train_texts": parsed,
+                "vocab": self.vectorizer.get_feature_names_out()}
+
+K_VALUES = [3, 5, 8, 10]
+SEEDS = [0, 1, 2, 3, 4]
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+rows = []
+overall_weights_rows = []
+quarter_weights_rows = []
+assignments = {}
+
+# Shared sentence embeddings reduce repeated encoding cost.
+embedder = SentenceTransformer(EMBEDDING_MODEL)
+embeddings = embedder.encode(docs, show_progress_bar=True, convert_to_numpy=True)
+
+for k in K_VALUES:
+    # FASTopic: fit five seeds, record only successful fits.
+    for seed in SEEDS:
+        print(f"FASTopic K={k}, seed={seed}")
+        try:
+            random.seed(seed); np.random.seed(seed)
+            prep = NgramPreprocessing(ngram_range=(2,2), vocab_size=5000)
+            model = FASTopic(k, prep, num_top_words=5000)
+            # Some releases accept seed/random_state; original user code did not.
+            t0 = time.time()
+            fitted = model.fit_transform(docs)
+            elapsed = time.time() - t0
+            if isinstance(fitted, tuple) and len(fitted) >= 2:
+                topic_top_words, doc_topic_dist = fitted[0], fitted[1]
+            else:
+                raise RuntimeError("Unexpected FASTopic fit_transform return format; inspect package API.")
+            doc_topic_dist = np.asarray(doc_topic_dist)
+            topic_terms = []
+            for topic_id in range(k):
+                try:
+                    raw = model.get_topic(topic_idx=topic_id, num_top_words=10)
+                    if isinstance(raw, dict): raw = list(raw.keys())
+                    elif isinstance(raw, list) and raw and isinstance(raw[0], tuple): raw = [x[0] for x in raw]
+                    topic_terms.append([str(x).replace(" ", "_") for x in list(raw)[:10]])
+                except Exception:
+                    topic_terms.append([])
+            uci, npmi, diversity = score_topics(topic_terms)
+            rows.append({"model":"FASTopic","k":k,"seed":seed,"status":"ok",
+                         "uci_coherence":uci,"npmi_coherence":npmi,"topic_diversity":diversity,
+                         "runtime_seconds":round(elapsed,2),"n_reviews":len(docs),
+                         "outlier_share":0.0,"error":""})
+            assignments[("FASTopic",k,seed)] = doc_topic_dist.argmax(axis=1)
+            weights = doc_topic_dist.mean(axis=0)
+            for ti, w in enumerate(weights):
+                overall_weights_rows.append({"model":"FASTopic","k":k,"seed":seed,"topic":int(ti),"overall_weight":float(w)})
+            tmp = pd.DataFrame(doc_topic_dist, columns=[f"topic_{i}" for i in range(doc_topic_dist.shape[1])])
+            tmp["quarter"] = df["quarter"].values
+            for q, grp in tmp.groupby("quarter"):
+                means = grp.drop(columns="quarter").mean(axis=0)
+                for col, w in means.items():
+                    quarter_weights_rows.append({"model":"FASTopic","k":k,"seed":seed,"quarter":q,
+                                                 "topic":int(col.split("_")[1]),"mean_topic_weight":float(w),
+                                                 "review_count":int(len(grp))})
+        except Exception as e:
+            rows.append({"model":"FASTopic","k":k,"seed":seed,"status":"failed",
+                         "uci_coherence":np.nan,"npmi_coherence":np.nan,"topic_diversity":np.nan,
+                         "runtime_seconds":np.nan,"n_reviews":len(docs),"outlier_share":np.nan,
+                         "error":repr(e)})
+            print("FASTopic fit failed:", repr(e))
+
+    # BERTopic: HDBSCAN discovers topics, then reduce to requested number.
+    print(f"BERTopic target K={k}")
+    try:
+        umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric="cosine", random_state=42)
+        hdbscan_model = HDBSCAN(min_cluster_size=15, metric="euclidean", prediction_data=True)
+        vectorizer_model = CountVectorizer(ngram_range=(2,2), stop_words="english", max_features=5000)
+        bt = BERTopic(embedding_model=None, umap_model=umap_model, hdbscan_model=hdbscan_model,
+                      vectorizer_model=vectorizer_model, calculate_probabilities=True, verbose=False)
+        t0 = time.time()
+        topics, probs = bt.fit_transform(docs, embeddings=embeddings)
+        if len(set(topics)-{-1}) > k:
+            bt.reduce_topics(docs, nr_topics=k)
+            topics = bt.topics_
+        elapsed = time.time() - t0
+        topic_ids = [tid for tid in bt.get_topic_info()["Topic"].tolist() if tid != -1]
+        topic_terms = []
+        for tid in topic_ids:
+            term_pairs = bt.get_topic(tid) or []
+            topic_terms.append([str(term).replace(" ", "_") for term, _ in term_pairs[:10]])
+        uci, npmi, diversity = score_topics(topic_terms)
+        outlier_share = float(np.mean(np.asarray(topics) == -1))
+        rows.append({"model":"BERTopic","k":k,"seed":42,"status":"ok",
+                     "uci_coherence":uci,"npmi_coherence":npmi,"topic_diversity":diversity,
+                     "runtime_seconds":round(elapsed,2),"n_reviews":len(docs),
+                     "outlier_share":outlier_share,"error":""})
+        # For chi-square, exclude outliers and retain only non-outlier records.
+        assignments[("BERTopic",k,42)] = np.asarray(topics)
+        for tid in topic_ids:
+            overall_weights_rows.append({"model":"BERTopic","k":k,"seed":42,"topic":int(tid),
+                                         "overall_weight":float(np.mean(np.asarray(topics)==tid))})
+        for q in df["quarter"].unique():
+            idx = np.where(df["quarter"].values == q)[0]
+            tq = np.asarray(topics)[idx]
+            for tid in topic_ids:
+                quarter_weights_rows.append({"model":"BERTopic","k":k,"seed":42,"quarter":q,
+                                             "topic":int(tid),"mean_topic_weight":float(np.mean(tq==tid)),
+                                             "review_count":int(len(idx))})
+    except Exception as e:
+        rows.append({"model":"BERTopic","k":k,"seed":42,"status":"failed",
+                     "uci_coherence":np.nan,"npmi_coherence":np.nan,"topic_diversity":np.nan,
+                     "runtime_seconds":np.nan,"n_reviews":len(docs),"outlier_share":np.nan,
+                     "error":repr(e)})
+        print("BERTopic fit failed:", repr(e))
+
+comparison = pd.DataFrame(rows)
+comparison.to_csv(outdir/"table_model_comparison.csv", index=False)
+pd.DataFrame(overall_weights_rows).to_csv(outdir/"table_overall_topic_weights.csv", index=False)
+pd.DataFrame(quarter_weights_rows).to_csv(outdir/"table_quarterly_weights_counts.csv", index=False)
+display(comparison)
