@@ -1,1 +1,33 @@
+from google.colab import files
+uploaded = files.upload()  # Select Airways_Customer data_cleaned-reviews.csv
+import io, os, re, json, time, random, warnings
+import numpy as np
+import pandas as pd
+import sklearn, gensim
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics import adjusted_rand_score
+from gensim.models.coherencemodel import CoherenceModel
+from gensim.corpora import Dictionary
+
+fname = next((n for n in uploaded if n.lower().endswith(".csv")), None)
+if fname is None:
+    raise ValueError("Upload the cleaned review CSV.")
+df0 = pd.read_csv(io.BytesIO(uploaded[fname]))
+required = {"comments", "date"}
+if not required.issubset(df0.columns):
+    raise ValueError(f"CSV must contain columns {required}; found {list(df0.columns)}")
+
+df0["comments"] = df0["comments"].fillna("").astype(str).str.strip()
+df0["date_parsed"] = pd.to_datetime(df0["date"], dayfirst=True, errors="coerce")
+df = df0[df0["comments"].ne("") & df0["date_parsed"].notna()].drop_duplicates("comments").reset_index(drop=True)
+docs = df["comments"].tolist()
+df["quarter"] = df["date_parsed"].dt.to_period("Q").astype(str)
+print("Input rows:", len(df0), "| Analysis rows:", len(df))
+print("Duplicates removed:", len(df0) - len(df))
+print("Date range:", df["date_parsed"].min(), "to", df["date_parsed"].max())
+print("FASTopic package and library versions:")
+import importlib.metadata as mdist
+for pkg in ["fastopic", "bertopic", "sentence-transformers", "gensim", "scikit-learn"]:
+    try: print(pkg, mdist.version(pkg))
+    except Exception as e: print(pkg, "version unavailable", e)
 
